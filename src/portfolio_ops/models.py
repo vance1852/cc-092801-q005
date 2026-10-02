@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import parse_utc, utc_text
 from .errors import ValidationFailed
 
 
@@ -104,6 +104,7 @@ class ResponseCenter:
     kind: str
     timezone: str
     capacity_units: Decimal
+    region: str = "default"
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ResponseCenter":
@@ -118,6 +119,7 @@ class ResponseCenter:
             name=required_text(raw.get("name"), "name"),
             kind=kind,
             timezone=timezone,
+            region=required_text(raw.get("region", "default"), "region", 64),
             capacity_units=decimal_value(
                 raw.get("capacity_units"), "capacity_units", minimum=Decimal("0")
             ),
@@ -259,4 +261,226 @@ class ResponseScenario:
             ),
             route_capacity_changes=parsed_road_corridors,
             demand_changes=parsed_demand,
+        )
+
+
+def timestamp_text(value: object, field: str) -> str:
+    text = required_text(value, field, 40)
+    try:
+        return utc_text(parse_utc(text, field))
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationScheme:
+    """候选项目的跨中心验证方案：样本类型需求量、所需设备与工时要求。"""
+
+    scheme_id: str
+    name: str
+    candidate_project_id: str
+    protocol_version: str
+    sample_requirements: tuple["SchemeSampleRequirement", ...]
+    equipment_requirements: tuple["SchemeEquipmentRequirement", ...]
+    duration_minutes: int
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ValidationScheme":
+        samples = raw.get("sample_requirements")
+        equipments = raw.get("equipment_requirements")
+        if not isinstance(samples, list) or not samples:
+            raise ValidationFailed("sample_requirements 至少包含一种样本类型")
+        if not isinstance(equipments, list) or not equipments:
+            raise ValidationFailed("equipment_requirements 至少包含一种设备")
+        parsed_samples = tuple(
+            SchemeSampleRequirement.from_dict(item, index)
+            for index, item in enumerate(samples)
+        )
+        parsed_equipment = tuple(
+            SchemeEquipmentRequirement.from_dict(item, index)
+            for index, item in enumerate(equipments)
+        )
+        sample_keys = [item.sample_type for item in parsed_samples]
+        if len(sample_keys) != len(set(sample_keys)):
+            raise ValidationFailed("验证方案内样本类型不能重复")
+        equipment_keys = [(item.equipment_kind, item.grade) for item in parsed_equipment]
+        if len(equipment_keys) != len(set(equipment_keys)):
+            raise ValidationFailed("验证方案内设备类型与等级组合不能重复")
+        duration = raw.get("duration_minutes", 60)
+        if isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 24 * 60:
+            raise ValidationFailed("duration_minutes 必须是 1 到 1440 的整数")
+        return cls(
+            scheme_id=identifier(raw.get("scheme_id"), "scheme_id"),
+            name=required_text(raw.get("name"), "name"),
+            candidate_project_id=identifier(raw.get("candidate_project_id"), "candidate_project_id"),
+            protocol_version=identifier(raw.get("protocol_version"), "protocol_version"),
+            sample_requirements=parsed_samples,
+            equipment_requirements=parsed_equipment,
+            duration_minutes=duration,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SchemeSampleRequirement:
+    sample_type: str
+    required_units: Decimal
+    grade: str
+
+    @classmethod
+    def from_dict(cls, raw: Any, index: int) -> "SchemeSampleRequirement":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed(f"sample_requirements[{index}] 必须是对象")
+        field = f"sample_requirements[{index}]"
+        return cls(
+            sample_type=required_text(raw.get("sample_type"), f"{field}.sample_type", 48),
+            required_units=decimal_value(raw.get("required_units"), f"{field}.required_units", minimum=Decimal("0.001")),
+            grade=required_text(raw.get("grade", "STANDARD"), f"{field}.grade", 32).upper(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SchemeEquipmentRequirement:
+    equipment_kind: str
+    units: int
+    grade: str
+
+    @classmethod
+    def from_dict(cls, raw: Any, index: int) -> "SchemeEquipmentRequirement":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed(f"equipment_requirements[{index}] 必须是对象")
+        field = f"equipment_requirements[{index}]"
+        return cls(
+            equipment_kind=required_text(raw.get("equipment_kind"), f"{field}.equipment_kind", 48),
+            units=positive_integer(raw.get("units", 1), f"{field}.units"),
+            grade=required_text(raw.get("grade", "STANDARD"), f"{field}.grade", 32).upper(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SampleCapabilityRecord:
+    center_id: str
+    sample_type: str
+    daily_capacity_units: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "SampleCapabilityRecord":
+        return cls(
+            center_id=identifier(raw.get("center_id"), "center_id"),
+            sample_type=required_text(raw.get("sample_type"), "sample_type", 48),
+            daily_capacity_units=decimal_value(
+                raw.get("daily_capacity_units"), "daily_capacity_units", minimum=Decimal("0.001")
+            ),
+        )
+
+
+EQUIPMENT_STATES = {"available", "maintenance", "retired"}
+
+
+@dataclass(frozen=True, slots=True)
+class EquipmentRecord:
+    equipment_id: str
+    center_id: str
+    equipment_kind: str
+    grade: str
+    state: str
+    unavailable_from: str | None
+    unavailable_until: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "EquipmentRecord":
+        state = required_text(raw.get("state", "available"), "state", 16).lower()
+        if state not in EQUIPMENT_STATES:
+            raise ValidationFailed("state 必须是 available、maintenance 或 retired")
+        unavailable_from = raw.get("unavailable_from")
+        unavailable_until = raw.get("unavailable_until")
+        start = None if unavailable_from is None else timestamp_text(unavailable_from, "unavailable_from")
+        end = None if unavailable_until is None else timestamp_text(unavailable_until, "unavailable_until")
+        if start is not None and end is not None and end <= start:
+            raise ValidationFailed("unavailable_until 必须晚于 unavailable_from")
+        return cls(
+            equipment_id=identifier(raw.get("equipment_id"), "equipment_id"),
+            center_id=identifier(raw.get("center_id"), "center_id"),
+            equipment_kind=required_text(raw.get("equipment_kind"), "equipment_kind", 48),
+            grade=required_text(raw.get("grade", "STANDARD"), "grade", 32).upper(),
+            state=state,
+            unavailable_from=start,
+            unavailable_until=end,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarWindowRecord:
+    center_id: str
+    opens_at: str
+    closes_at: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "CalendarWindowRecord":
+        opens_at = timestamp_text(raw.get("opens_at"), "opens_at")
+        closes_at = timestamp_text(raw.get("closes_at"), "closes_at")
+        if closes_at <= opens_at:
+            raise ValidationFailed("closes_at 必须晚于 opens_at")
+        return cls(
+            center_id=identifier(raw.get("center_id"), "center_id"),
+            opens_at=opens_at,
+            closes_at=closes_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceBookingRecord:
+    center_id: str
+    starts_at: str
+    ends_at: str
+    units: Decimal
+    reference_id: str
+    sample_type: str | None
+    equipment_kind: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ResourceBookingRecord":
+        sample_type = raw.get("sample_type")
+        equipment_kind = raw.get("equipment_kind")
+        if (sample_type is None or not str(sample_type).strip()) and (
+            equipment_kind is None or not str(equipment_kind).strip()
+        ):
+            raise ValidationFailed("sample_type 与 equipment_kind 至少提供一个")
+        starts_at = timestamp_text(raw.get("starts_at"), "starts_at")
+        ends_at = timestamp_text(raw.get("ends_at"), "ends_at")
+        if ends_at <= starts_at:
+            raise ValidationFailed("ends_at 必须晚于 starts_at")
+        return cls(
+            center_id=identifier(raw.get("center_id"), "center_id"),
+            starts_at=starts_at,
+            ends_at=ends_at,
+            units=decimal_value(raw.get("units", 1), "units", minimum=Decimal("0.001")),
+            reference_id=identifier(raw.get("reference_id"), "reference_id"),
+            sample_type=None if sample_type is None else required_text(sample_type, "sample_type", 48),
+            equipment_kind=None if equipment_kind is None else required_text(equipment_kind, "equipment_kind", 48),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PrecheckQuery:
+    candidate_project_id: str
+    scheme_id: str
+    target_center_id: str
+    window_starts_at: str
+    window_ends_at: str
+    search_region: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PrecheckQuery":
+        start = timestamp_text(raw.get("window_starts_at"), "window_starts_at")
+        end = timestamp_text(raw.get("window_ends_at"), "window_ends_at")
+        if end <= start:
+            raise ValidationFailed("window_ends_at 必须晚于 window_starts_at")
+        search_region = raw.get("search_region")
+        return cls(
+            candidate_project_id=identifier(raw.get("candidate_project_id"), "candidate_project_id"),
+            scheme_id=identifier(raw.get("scheme_id"), "scheme_id"),
+            target_center_id=identifier(raw.get("target_center_id"), "target_center_id"),
+            window_starts_at=start,
+            window_ends_at=end,
+            search_region=None if search_region is None else required_text(search_region, "search_region", 64),
         )

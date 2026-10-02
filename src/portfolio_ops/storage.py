@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS response_centers (
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
     timezone TEXT NOT NULL,
+    region TEXT NOT NULL DEFAULT 'default',
     capacity_units TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
@@ -194,11 +195,82 @@ CREATE TABLE IF NOT EXISTS traffic_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_traffic_audit_entity
 ON traffic_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS validation_schemes (
+    scheme_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    candidate_project_id TEXT NOT NULL,
+    protocol_version TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS center_sample_capabilities (
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    sample_type TEXT NOT NULL,
+    daily_capacity_units TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(center_id, sample_type)
+);
+
+CREATE TABLE IF NOT EXISTS center_equipment (
+    equipment_id TEXT PRIMARY KEY,
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    equipment_kind TEXT NOT NULL,
+    grade TEXT NOT NULL DEFAULT 'STANDARD',
+    state TEXT NOT NULL DEFAULT 'available'
+        CHECK(state IN ('available','maintenance','retired')),
+    unavailable_from TEXT,
+    unavailable_until TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_center_equipment
+ON center_equipment(center_id, equipment_kind, state);
+
+CREATE TABLE IF NOT EXISTS center_calendar_windows (
+    window_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    opens_at TEXT NOT NULL,
+    closes_at TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL,
+    CHECK(closes_at > opens_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_center_calendar
+ON center_calendar_windows(center_id, opens_at, closes_at);
+
+CREATE TABLE IF NOT EXISTS validation_resource_bookings (
+    booking_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    sample_type TEXT,
+    equipment_kind TEXT,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    units TEXT NOT NULL DEFAULT '1',
+    reference_id TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL,
+    CHECK(ends_at > starts_at),
+    CHECK(sample_type IS NOT NULL OR equipment_kind IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_bookings
+ON validation_resource_bookings(center_id, starts_at, ends_at);
 """
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+def connect(path: str | Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, timeout=10, check_same_thread=check_same_thread
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +281,12 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(response_centers)").fetchall()
+    }
+    if "region" not in columns:
+        connection.execute("ALTER TABLE response_centers ADD COLUMN region TEXT NOT NULL DEFAULT 'default'")
 
 
 @contextmanager

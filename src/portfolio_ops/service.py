@@ -7,11 +7,24 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    CalendarWindowRecord,
+    EquipmentRecord,
+    PrecheckQuery,
+    ResourceBookingRecord,
+    RiskIndexRecord,
+    ResponseCenter,
+    PreservationResourceLot,
+    DispatchRequest,
+    RoadCorridor,
+    ResponseScenario,
+    SampleCapabilityRecord,
+    ValidationScheme,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -27,14 +40,23 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .precheck import (
+    Booking,
+    CenterSnapshot,
+    EquipmentItem,
+    EquipmentRequirement,
+    Interval,
+    SampleRequirement,
+    build_precheck_result,
+)
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run", "precheck.run"},
+    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write", "schedule.write", "precheck.run"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "precheck.run"},
+    "auditor": {"report.read", "audit.read", "precheck.run"},
 }
 
 
@@ -181,13 +203,14 @@ class CollectionLogisticsService:
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO response_centers(center_id,name,kind,timezone,capacity_units,created_at) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO response_centers(center_id,name,kind,timezone,region,capacity_units,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
                     (
                         facility.center_id,
                         facility.name,
                         facility.kind,
                         facility.timezone,
+                        facility.region,
                         decimal_text(facility.capacity_units),
                         self._now(),
                     ),
@@ -547,6 +570,275 @@ class CollectionLogisticsService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    def register_validation_scheme(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        scheme = ValidationScheme.from_dict(raw)
+        definition = canonical_json(raw)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO validation_schemes(scheme_id,name,candidate_project_id,protocol_version,"
+                    "definition_json,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        scheme.scheme_id,
+                        scheme.name,
+                        scheme.candidate_project_id,
+                        scheme.protocol_version,
+                        definition,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("validation_scheme", scheme.scheme_id, "validation_scheme.created", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("验证方案编号已经存在") from exc
+        return {"scheme_id": scheme.scheme_id, "candidate_project_id": scheme.candidate_project_id, "state": "registered"}
+
+    def register_sample_capability(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        record = SampleCapabilityRecord.from_dict(raw)
+        self._facility_row(record.center_id)
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO center_sample_capabilities(center_id,sample_type,daily_capacity_units,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(center_id,sample_type) DO UPDATE SET daily_capacity_units=excluded.daily_capacity_units,"
+                "revision=center_sample_capabilities.revision+1,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (record.center_id, record.sample_type, decimal_text(record.daily_capacity_units), actor_id, now),
+            )
+            self._audit("sample_capability", f"{record.center_id}:{record.sample_type}", "sample_capability.registered", actor_id, raw)
+        return {
+            "center_id": record.center_id,
+            "sample_type": record.sample_type,
+            "daily_capacity_units": decimal_text(record.daily_capacity_units),
+        }
+
+    def register_equipment(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        record = EquipmentRecord.from_dict(raw)
+        self._facility_row(record.center_id)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO center_equipment(equipment_id,center_id,equipment_kind,grade,state,"
+                    "unavailable_from,unavailable_until,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        record.equipment_id,
+                        record.center_id,
+                        record.equipment_kind,
+                        record.grade,
+                        record.state,
+                        record.unavailable_from,
+                        record.unavailable_until,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit("equipment", record.equipment_id, "equipment.registered", actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("设备编号冲突或中心不存在") from exc
+        return {
+            "equipment_id": record.equipment_id,
+            "center_id": record.center_id,
+            "equipment_kind": record.equipment_kind,
+            "state": record.state,
+        }
+
+    def register_calendar_window(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "schedule.write")
+        record = CalendarWindowRecord.from_dict(raw)
+        self._facility_row(record.center_id)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO center_calendar_windows(center_id,opens_at,closes_at,created_by,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (record.center_id, record.opens_at, record.closes_at, actor_id, self._now()),
+            )
+            window_id = int(cursor.lastrowid)
+            self._audit("calendar_window", str(window_id), "calendar_window.registered", actor_id, raw)
+        return {"window_id": window_id, "center_id": record.center_id, "opens_at": record.opens_at, "closes_at": record.closes_at}
+
+    def register_booking(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "schedule.write")
+        record = ResourceBookingRecord.from_dict(raw)
+        self._facility_row(record.center_id)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO validation_resource_bookings(center_id,sample_type,equipment_kind,starts_at,ends_at,"
+                "units,reference_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    record.center_id,
+                    record.sample_type,
+                    record.equipment_kind,
+                    record.starts_at,
+                    record.ends_at,
+                    decimal_text(record.units),
+                    record.reference_id,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            booking_id = int(cursor.lastrowid)
+            self._audit("resource_booking", str(booking_id), "resource_booking.registered", actor_id, raw)
+        return {"booking_id": booking_id, "center_id": record.center_id, "reference_id": record.reference_id}
+
+    def _facility_row(self, center_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM response_centers WHERE center_id=?", (center_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("中心不存在")
+        return row
+
+    def _center_snapshot(self, row: sqlite3.Row) -> CenterSnapshot:
+        center_id = row["center_id"]
+        sample_rows = self.connection.execute(
+            "SELECT sample_type,daily_capacity_units FROM center_sample_capabilities WHERE center_id=?",
+            (center_id,),
+        ).fetchall()
+        sample_capacity = {
+            item["sample_type"]: Decimal(item["daily_capacity_units"]) for item in sample_rows
+        }
+        equipment_rows = self.connection.execute(
+            "SELECT * FROM center_equipment WHERE center_id=?", (center_id,)
+        ).fetchall()
+        equipment = [
+            EquipmentItem(
+                equipment_id=item["equipment_id"],
+                equipment_kind=item["equipment_kind"],
+                grade=item["grade"],
+                state=item["state"],
+                unavailable_from=item["unavailable_from"],
+                unavailable_until=item["unavailable_until"],
+            )
+            for item in equipment_rows
+        ]
+        window_rows = self.connection.execute(
+            "SELECT opens_at,closes_at FROM center_calendar_windows WHERE center_id=?",
+            (center_id,),
+        ).fetchall()
+        windows = [Interval(item["opens_at"], item["closes_at"]) for item in window_rows]
+        booking_rows = self.connection.execute(
+            "SELECT sample_type,equipment_kind,starts_at,ends_at,units FROM validation_resource_bookings "
+            "WHERE center_id=?",
+            (center_id,),
+        ).fetchall()
+        bookings = [
+            Booking(
+                starts_at=item["starts_at"],
+                ends_at=item["ends_at"],
+                units=Decimal(item["units"]),
+                sample_type=item["sample_type"],
+                equipment_kind=item["equipment_kind"],
+            )
+            for item in booking_rows
+        ]
+        return CenterSnapshot(
+            center_id=center_id,
+            name=row["name"],
+            region=row["region"],
+            active=bool(row["active"]),
+            sample_capacity=sample_capacity,
+            equipment=equipment,
+            windows=windows,
+            bookings=bookings,
+        )
+
+    def _snapshot_digest(
+        self,
+        scheme_row: sqlite3.Row,
+        snapshots: Sequence[CenterSnapshot],
+        window: Interval,
+    ) -> str:
+        summary = {
+            "scheme": {"scheme_id": scheme_row["scheme_id"], "revision": scheme_row["revision"]},
+            "window": [window.starts_at, window.ends_at],
+            "centers": [
+                {
+                    "center_id": snapshot.center_id,
+                    "region": snapshot.region,
+                    "active": snapshot.active,
+                    "sample_capacity": {
+                        key: decimal_text(value) for key, value in sorted(snapshot.sample_capacity.items())
+                    },
+                    "equipment": [
+                        (item.equipment_id, item.equipment_kind, item.grade, item.state,
+                         item.unavailable_from, item.unavailable_until)
+                        for item in sorted(snapshot.equipment, key=lambda item: item.equipment_id)
+                    ],
+                    "windows": sorted((item.starts_at, item.ends_at) for item in snapshot.windows),
+                    "bookings": sorted(
+                        (item.starts_at, item.ends_at, decimal_text(item.units), item.sample_type, item.equipment_kind)
+                        for item in snapshot.bookings
+                    ),
+                }
+                for snapshot in sorted(snapshots, key=lambda item: item.center_id)
+            ],
+        }
+        return digest(summary)[:16]
+
+    def precheck_validation(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """跨中心验证能力预检：只读，不扣减库存、不占用资源。"""
+
+        self._require(actor_id, "precheck.run")
+        query = PrecheckQuery.from_dict(raw)
+        # 单个只读事务保证中心、样本、设备与排期来自同一快照
+        with transaction(self.connection):
+            scheme_row = self.connection.execute(
+                "SELECT * FROM validation_schemes WHERE scheme_id=?", (query.scheme_id,)
+            ).fetchone()
+            if scheme_row is None:
+                raise NotFound("验证方案不存在")
+            scheme = ValidationScheme.from_dict(json.loads(scheme_row["definition_json"]))
+            if scheme.candidate_project_id != query.candidate_project_id:
+                raise ValidationFailed("验证方案与候选项目不匹配")
+            target_row = self.connection.execute(
+                "SELECT * FROM response_centers WHERE center_id=?", (query.target_center_id,)
+            ).fetchone()
+            if target_row is None:
+                raise NotFound("目标中心不存在")
+            center_rows = self.connection.execute(
+                "SELECT * FROM response_centers ORDER BY center_id"
+            ).fetchall()
+            snapshots = [self._center_snapshot(row) for row in center_rows]
+            target_snapshot = next(item for item in snapshots if item.center_id == query.target_center_id)
+            other_snapshots = [
+                item
+                for item in snapshots
+                if item.center_id != query.target_center_id
+                and (
+                    query.search_region is None
+                    or item.region == query.search_region
+                    or item.region == target_row["region"]
+                )
+            ]
+            samples = [
+                SampleRequirement(item.sample_type, item.required_units, item.grade)
+                for item in scheme.sample_requirements
+            ]
+            equipments = [
+                EquipmentRequirement(item.equipment_kind, item.units, item.grade)
+                for item in scheme.equipment_requirements
+            ]
+            window = Interval(query.window_starts_at, query.window_ends_at)
+            data_revision = self._snapshot_digest(scheme_row, snapshots, window)
+            result = build_precheck_result(
+                query={
+                    "candidate_project_id": query.candidate_project_id,
+                    "scheme_id": query.scheme_id,
+                },
+                target_center=target_snapshot,
+                other_centers=other_snapshots,
+                samples=samples,
+                equipments=equipments,
+                window=window,
+                duration_minutes=scheme.duration_minutes,
+                evaluated_at=self._now(),
+                data_revision=data_revision,
+            )
+        return result
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")
