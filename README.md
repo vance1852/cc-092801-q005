@@ -36,7 +36,36 @@ PYTHONPATH=src python3 -m discovery_lab.acceptance --workspace .
 PYTHONPATH=src python3 -m licensing_ops.acceptance
 ~~~
 
-三条命令会在临时 SQLite 数据库中完成研发中心与交接通道登记、研究资源分配、候选药证据分析及交易风险处置，不访问外部网络。
+三条命令会在临时 SQLite 数据库中完成研发中心与交接通道登记、研究资源分配、候选药证据分析及交易风险处置，不访问外部网络。`portfolio_ops` 验收还包含一次跨中心验证能力预检，输出 `precheck.conclusion`（feasible / gap / infeasible）。
+
+## 跨中心验证能力预检
+
+在启动跨中心验证之前，可以通过预检一次性判断目标中心是否同时具备所需样本类型能力、设备能力、可用连续排产时段和足够研究资源余量：
+
+~~~bash
+curl -s -X POST http://127.0.0.1:8080/validation_prechecks \
+  -H 'Content-Type: application/json' -H 'X-Actor-Id: plan' -d '{
+    "precheck_id": "precheck-001",
+    "project_id": "candidate-onco-1",
+    "protocol_id": "protocol-pk-001",
+    "center_id": "collection-east",
+    "window_start": "2026-09-25T00:00:00Z",
+    "window_end": "2026-09-25T14:00:00Z",
+    "required_minutes": 240,
+    "sample_requirements": [{"sample_type": "PLASMA", "quantity_units": "200"}],
+    "equipment_requirements": [{"equipment_kind": "SEQUENCER", "quantity_units": "2"}],
+    "resource_requirements": [{"preservation_resource_kind": "preservation-box", "quantity_units": "100"}]
+  }'
+~~~
+
+预检结论为 `feasible`（可执行）、`gap`（存在可恢复缺口）或 `infeasible`（不可执行）。结论为缺口时，`gaps` 逐项给出维度（样本 / 设备 / 排期 / 研究资源）、需要与可用数量、缺口数量及原因；`alternatives` 按满足度和最早可用时间排好序，分别给出同区域与其他区域替代中心。预检是只读快照操作：不扣减库存、不占用排期、不写审计事件，每次调用读取已提交的最新中心、样本、设备、库存与排期数据。
+
+预检目录通过以下接口维护（均需要 planner 角色并写入审计链）：
+
+- `POST /response_centers/{center_id}/region`：登记中心所属区域；
+- `POST /response_centers/sample_capabilities`：登记/更新样本类型处理能力；
+- `POST /response_centers/equipment_capabilities`：登记/更新设备验证能力；
+- `POST /response_centers/schedule_windows`：登记每周重复的本地时间排产窗口（按中心时区换算为 UTC）。
 
 ## HTTP 服务
 

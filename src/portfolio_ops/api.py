@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ class Response:
 class JsonApplication:
     def __init__(self, service: CollectionLogisticsService) -> None:
         self.service = service
+        self.service_lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +47,12 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        # 所有 HTTP 请求共享同一 SQLite 连接，而事务状态是连接级别的；
+        # 串行化处理，避免预检只读事务与写事务在线程间交错。
+        with self.service_lock:
+            return self._handle_unlocked(method, target, headers, body)
+
+    def _handle_unlocked(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -63,6 +71,16 @@ class JsonApplication:
                 return Response(200, self.service.risk_summary(parts[2], int(query.get("sessions", ["20"])[0])))
             if method == "POST" and path == "/response_centers":
                 return Response(201, self.service.create_facility(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "response_centers" and parts[2] == "region":
+                return Response(200, self.service.assign_center_region(actor, parts[1], payload["region"]))
+            if method == "POST" and path == "/response_centers/sample_capabilities":
+                return Response(201, self.service.register_sample_capability(actor, payload))
+            if method == "POST" and path == "/response_centers/equipment_capabilities":
+                return Response(201, self.service.register_equipment_capability(actor, payload))
+            if method == "POST" and path == "/response_centers/schedule_windows":
+                return Response(201, self.service.add_schedule_window(actor, payload))
+            if method == "POST" and path == "/validation_prechecks":
+                return Response(200, self.service.run_precheck(actor, payload))
             if method == "POST" and path == "/road_corridors":
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "outages":

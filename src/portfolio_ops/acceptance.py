@@ -23,14 +23,31 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_facility("plan", {"center_id": "collection-east", "name": "北部实验样本事件保藏中心", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_units": "500000"})
     service.create_facility("plan", {"center_id": "receiving-vault-b", "name": "沿海终端", "kind": "receiving-vault", "timezone": "Asia/Shanghai", "capacity_units": "800000"})
     service.create_route("plan", {"corridor_id": "transfer-east-1", "origin_center_id": "collection-east", "destination_center_id": "receiving-vault-b", "preservation_resource_kind": "preservation-box", "hourly_capacity": "100000", "delay_basis_points": 25, "response_minutes": 36})
+    # 跨中心验证能力预检目录：区域、样本类型能力、设备能力与每周排产窗口。
+    service.assign_center_region("plan", "collection-east", "east")
+    service.register_sample_capability("plan", {"center_id": "collection-east", "sample_type": "PLASMA", "capacity_units": "1200"})
+    service.register_equipment_capability("plan", {"center_id": "collection-east", "equipment_kind": "SEQUENCER", "capacity_units": "6"})
+    service.add_schedule_window("plan", {"center_id": "collection-east", "weekday": 4, "start_time": "08:00", "end_time": "22:00"})
     service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-001", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "150000", "unit_cost_cny": "91.25", "received_at": "2026-09-24T06:00:00Z"})
+    precheck = service.run_precheck("plan", {
+        "precheck_id": "precheck-001",
+        "project_id": "candidate-onco-1",
+        "protocol_id": "protocol-pk-001",
+        "center_id": "collection-east",
+        "window_start": "2026-09-25T00:00:00Z",
+        "window_end": "2026-09-25T14:00:00Z",
+        "required_minutes": 240,
+        "sample_requirements": [{"sample_type": "PLASMA", "quantity_units": "200"}],
+        "equipment_requirements": [{"equipment_kind": "SEQUENCER", "quantity_units": "2"}],
+        "resource_requirements": [{"preservation_resource_kind": "preservation-box", "quantity_units": "100"}],
+    })
     service.submit_dispatch("dispatch", {"dispatch_id": "nom-001", "corridor_id": "transfer-east-1", "specimen_event_id": "herbarium-room-east", "duty_date": "2026-09-25", "requested_units": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "transfer-east-1", "2026-09-25")
     deployment = service.dispatch_deployment("dispatch", "deployment-001", "nom-001", "lot-001", 2)
     service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "主干路恢复通行与实验样本事件需求回落", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
     service.approve_scenario("risk", "storage-recovery", 1)
     scenario = service.run_scenario("plan", "storage-recovery", "2026-09-23")
-    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "precheck": {"precheck_id": precheck["precheck_id"], "conclusion": precheck["conclusion"], "gap_count": precheck["gap_count"], "eligible_alternatives": precheck["alternatives"]["eligible"]}, "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

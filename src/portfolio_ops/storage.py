@@ -171,6 +171,55 @@ CREATE TABLE IF NOT EXISTS response_scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS center_regions (
+    center_id TEXT PRIMARY KEY REFERENCES response_centers(center_id),
+    region TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS center_sample_capabilities (
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    sample_type TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    capacity_units TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(center_id, sample_type, grade)
+);
+
+CREATE TABLE IF NOT EXISTS center_equipment_capabilities (
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    equipment_kind TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    capacity_units TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(center_id, equipment_kind, grade)
+);
+
+CREATE TABLE IF NOT EXISTS center_schedule_windows (
+    window_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+    weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    updated_at TEXT NOT NULL,
+    UNIQUE(center_id, weekday, start_time, end_time),
+    CHECK(end_time > start_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_windows_center
+ON center_schedule_windows(center_id, weekday, active);
+
 CREATE TABLE IF NOT EXISTS traffic_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -198,7 +247,9 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 会在工作线程中复用同一连接，关闭同线程限制；
+    # SQLite 默认序列化线程模式配合 WAL 与 busy_timeout 保证并发安全。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

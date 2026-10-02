@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario, identifier
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -27,12 +27,20 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .preflight import (
+    EquipmentCapability,
+    PrecheckRequest,
+    SampleCapability,
+    ScheduleWindow,
+    evaluate_precheck,
+    region_text,
+)
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
+    "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run", "precheck.run"},
+    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write", "precheck.run"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -197,6 +205,123 @@ class CollectionLogisticsService:
             raise Conflict("设施编号已经存在") from exc
         return dict(raw)
 
+    def _center(self, center_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM response_centers WHERE center_id=?", (center_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("研发中心不存在")
+        return row
+
+    def assign_center_region(self, actor_id: str, center_id: str, region: str) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        self._center(center_id)
+        region_name = region_text(region)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO center_regions(center_id,region,updated_by,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(center_id) DO UPDATE SET region=excluded.region,"
+                "revision=center_regions.revision+1,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (center_id, region_name, actor_id, self._now()),
+            )
+            self._audit("facility", center_id, "center.region.assigned", actor_id, {"region": region_name})
+        return {"center_id": center_id, "region": region_name}
+
+    def register_sample_capability(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        capability = SampleCapability.from_dict(raw)
+        center_id = identifier(raw["center_id"], "center_id")
+        self._center(center_id)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO center_sample_capabilities(center_id,sample_type,grade,capacity_units,active,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(center_id,sample_type,grade) DO UPDATE SET "
+                "capacity_units=excluded.capacity_units,active=excluded.active,revision=center_sample_capabilities.revision+1,"
+                "updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (
+                    center_id, capability.sample_type, capability.grade,
+                    decimal_text(capability.capacity_units), 1 if capability.active else 0,
+                    actor_id, self._now(),
+                ),
+            )
+            self._audit("facility", center_id, "capability.sample.registered", actor_id, {
+                "sample_type": capability.sample_type,
+                "grade": capability.grade,
+                "capacity_units": decimal_text(capability.capacity_units),
+                "active": capability.active,
+            })
+        return {
+            "center_id": center_id,
+            "sample_type": capability.sample_type,
+            "grade": capability.grade,
+            "capacity_units": decimal_text(capability.capacity_units),
+            "active": capability.active,
+        }
+
+    def register_equipment_capability(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        capability = EquipmentCapability.from_dict(raw)
+        center_id = identifier(raw["center_id"], "center_id")
+        self._center(center_id)
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO center_equipment_capabilities(center_id,equipment_kind,grade,capacity_units,active,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(center_id,equipment_kind,grade) DO UPDATE SET "
+                "capacity_units=excluded.capacity_units,active=excluded.active,revision=center_equipment_capabilities.revision+1,"
+                "updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (
+                    center_id, capability.equipment_kind, capability.grade,
+                    decimal_text(capability.capacity_units), 1 if capability.active else 0,
+                    actor_id, self._now(),
+                ),
+            )
+            self._audit("facility", center_id, "capability.equipment.registered", actor_id, {
+                "equipment_kind": capability.equipment_kind,
+                "grade": capability.grade,
+                "capacity_units": decimal_text(capability.capacity_units),
+                "active": capability.active,
+            })
+        return {
+            "center_id": center_id,
+            "equipment_kind": capability.equipment_kind,
+            "grade": capability.grade,
+            "capacity_units": decimal_text(capability.capacity_units),
+            "active": capability.active,
+        }
+
+    def add_schedule_window(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "catalog.write")
+        center_id = identifier(raw.get("center_id"), "center_id")
+        self._center(center_id)
+        window = ScheduleWindow.from_dict(raw)
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO center_schedule_windows(center_id,weekday,start_time,end_time,active,updated_by,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        center_id, window.weekday, window.start_time, window.end_time,
+                        1 if window.active else 0, actor_id, self._now(),
+                    ),
+                )
+                window_id = int(cursor.lastrowid)
+                self._audit("facility", center_id, "schedule.window.added", actor_id, {
+                    "window_id": window_id,
+                    "weekday": window.weekday,
+                    "start_time": window.start_time,
+                    "end_time": window.end_time,
+                })
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("同一中心的重复排产窗口已经存在") from exc
+        return {
+            "window_id": window_id,
+            "center_id": center_id,
+            "weekday": window.weekday,
+            "start_time": window.start_time,
+            "end_time": window.end_time,
+            "active": window.active,
+        }
+
     def create_route(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "catalog.write")
         route = RoadCorridor.from_dict(raw)
@@ -296,6 +421,93 @@ class CollectionLogisticsService:
             (center_id, preservation_resource_kind),
         ).fetchall()
         return {"center_id": center_id, "preservation_resource_kind": preservation_resource_kind, **weighted_inventory_cost(rows)}
+
+    def run_precheck(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "precheck.run")
+        request = PrecheckRequest.from_dict(raw)
+        now = self.clock.now()
+        # 预检是只读操作：显式开启一个读事务并在结束时回滚。整个评估共享同一
+        # 快照，因此不会扣减库存、占用排期或写入审计；下一次预检开启新快照，
+        # 中心、样本、设备、库存或排期数据的变化都会反映到最新结果中。
+        self.connection.execute("BEGIN")
+        try:
+            centers = {
+                row["center_id"]: {
+                    "center_id": row["center_id"],
+                    "name": row["name"],
+                    "timezone": row["timezone"],
+                    "active": bool(row["active"]),
+                }
+                for row in self.connection.execute(
+                    "SELECT center_id,name,timezone,active FROM response_centers"
+                ).fetchall()
+            }
+            if request.center_id not in centers:
+                raise NotFound("研发中心不存在")
+            regions = {
+                row["center_id"]: row["region"]
+                for row in self.connection.execute("SELECT center_id,region FROM center_regions").fetchall()
+            }
+
+            def _capability_snapshot(table: str, kind_column: str) -> dict[str, list[dict[str, Any]]]:
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                rows = self.connection.execute(
+                    f"SELECT center_id,{kind_column},grade,capacity_units,active FROM {table}"
+                ).fetchall()
+                for row in rows:
+                    grouped.setdefault(row["center_id"], []).append({
+                        "center_id": row["center_id"],
+                        kind_column: row[kind_column],
+                        "grade": row["grade"],
+                        "capacity_units": row["capacity_units"],
+                        "active": bool(row["active"]),
+                    })
+                return grouped
+
+            def _window_snapshot() -> dict[str, list[dict[str, Any]]]:
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                for row in self.connection.execute(
+                    "SELECT center_id,weekday,start_time,end_time,active FROM center_schedule_windows"
+                ).fetchall():
+                    grouped.setdefault(row["center_id"], []).append({
+                        "center_id": row["center_id"],
+                        "weekday": row["weekday"],
+                        "start_time": row["start_time"],
+                        "end_time": row["end_time"],
+                        "active": bool(row["active"]),
+                    })
+                return grouped
+
+            def _inventory_snapshot() -> dict[str, list[dict[str, Any]]]:
+                totals: dict[tuple[str, str], Decimal] = {}
+                for row in self.connection.execute(
+                    "SELECT center_id,preservation_resource_kind,available_units "
+                    "FROM preservation_resource_lots"
+                ).fetchall():
+                    key = (row["center_id"], row["preservation_resource_kind"])
+                    totals[key] = totals.get(key, Decimal("0")) + Decimal(row["available_units"])
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                for (center_id, kind), available in totals.items():
+                    grouped.setdefault(center_id, []).append({
+                        "center_id": center_id,
+                        "preservation_resource_kind": kind,
+                        "available_units": decimal_text(quantize_volume(available)),
+                    })
+                return grouped
+
+            result = evaluate_precheck(
+                request,
+                centers=centers,
+                regions=regions,
+                samples_by_center=_capability_snapshot("center_sample_capabilities", "sample_type"),
+                equipment_by_center=_capability_snapshot("center_equipment_capabilities", "equipment_kind"),
+                windows_by_center=_window_snapshot(),
+                inventory_by_center=_inventory_snapshot(),
+                now=now,
+            )
+        finally:
+            self.connection.execute("ROLLBACK")
+        return result
 
     def submit_dispatch(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "dispatch_request.write")
